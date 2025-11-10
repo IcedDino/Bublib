@@ -2,3 +2,5 @@ flask
 azure-eventhub
 gunicorn
 redis
+azure-iot-device
+azure-iot-hub
