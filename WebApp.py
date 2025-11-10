@@ -32,9 +32,13 @@ HTML_TEMPLATE = """
 <html>
 <head>
     <title>Bublib Smart Bulb</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
     <style>
         body {
+            padding-top: env(safe-area-inset-top);
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
             background: #1c1c1e;
             color: white;
