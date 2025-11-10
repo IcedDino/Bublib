@@ -1,3 +1,4 @@
-Flask
-gunicorn
+flask
 azure-eventhub
+gunicorn
+redis

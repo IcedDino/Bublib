@@ -6,21 +6,29 @@ import time
 from datetime import datetime
 from flask import Flask, render_template, Response, request
 from azure.eventhub import EventHubConsumerClient
+import redis
 
 # ---------------- CONFIGURATION ----------------
 EVENT_HUB_CONNECTION_STRING = os.environ.get("EVENT_HUB_CONN_STR") or "Endpoint=sb://iothub-ns-mvptorreta-55640691-46b6b52c16.servicebus.windows.net/;SharedAccessKeyName=service;SharedAccessKey=J9kflef+yGNDptqfJFSLUugtYaOrsNxZ2AIoTP52ALw=;EntityPath=mvptorreta"
 CONSUMER_GROUP = "$Default"
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
-# ---------------- GLOBAL STATE ----------------
-latest_telemetry = {
+# ---------------- INITIAL STATE ----------------
+# This is the default state if Redis is empty.
+INITIAL_TELEMETRY = {
     "motion": False,
     "light_status": "OFF", # ON, OFF
     "auto_mode": True,
     "received_at": None
 }
-telemetry_lock = threading.Lock()
 
-# ---------------- FLASK APP ----------------
+# ---------------- REDIS & FLASK APP ----------------
+# Connect to Redis. `decode_responses=True` means we get strings back, not bytes.
+redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+
+# The key we will use to store our state hash in Redis.
+REDIS_KEY = "bublib:telemetry"
+
 app = Flask(__name__)
 
 # ---------------- HTML TEMPLATE ----------------
@@ -265,24 +273,34 @@ def index():
 
 @app.route('/toggle_auto', methods=['POST'])
 def toggle_auto():
-    global latest_telemetry
     data = request.get_json()
-    with telemetry_lock:
-        latest_telemetry['auto_mode'] = data.get('auto_mode', True)
+    new_mode = data.get('auto_mode', True)
+    redis_client.hset(REDIS_KEY, 'auto_mode', json.dumps(new_mode))
     return "OK"
 
 @app.route('/manual_control', methods=['POST'])
 def manual_control():
-    global latest_telemetry
-    with telemetry_lock:
-        # Manual control is only allowed if auto_mode is off
-        if not latest_telemetry['auto_mode']:
-            if latest_telemetry['light_status'] == 'ON':
-                latest_telemetry['light_status'] = 'OFF'
-            else:
-                latest_telemetry['light_status'] = 'ON'
-    return "OK"
+    # Use a Redis transaction to safely read and write the state.
+    with redis_client.pipeline() as pipe:
+        try:
+            pipe.watch(REDIS_KEY) # Watch for changes from other clients
+            current_state = pipe.hgetall(REDIS_KEY)
+            is_auto_mode = json.loads(current_state.get('auto_mode', 'true'))
 
+            # Manual control is only allowed if auto_mode is off
+            if not is_auto_mode:
+                light_status = current_state.get('light_status', 'OFF')
+                new_light_status = 'OFF' if light_status == 'ON' else 'ON'
+                
+                pipe.multi() # Start transaction
+                pipe.hset(REDIS_KEY, 'light_status', new_light_status)
+                pipe.execute()
+        except redis.exceptions.WatchError:
+            # The state was changed by another process (e.g., the stream loop)
+            # while we were working. We can just ignore the click.
+            pass
+
+    return "OK"
 
 @app.route('/stream')
 def stream():
@@ -290,21 +308,29 @@ def stream():
         last_sent = None
         while True:
             with telemetry_lock:
+                # Fetch the complete state from Redis
+                current_state_str = redis_client.hgetall(REDIS_KEY)
+                # Deserialize values from JSON strings
+                current_state = {
+                    'motion': json.loads(current_state_str.get('motion', 'false')),
+                    'light_status': current_state_str.get('light_status', INITIAL_TELEMETRY['light_status']),
+                    'auto_mode': json.loads(current_state_str.get('auto_mode', 'true')),
+                    'received_at': current_state_str.get('received_at', None)
+                }
+
                 # Server-side logic for auto mode
-                if latest_telemetry['auto_mode']:
-                    if latest_telemetry['motion']:
-                        latest_telemetry['light_status'] = 'ON'
-                    else:
-                        latest_telemetry['light_status'] = 'OFF'
+                if current_state['auto_mode']:
+                    new_light_status = 'ON' if current_state['motion'] else 'OFF'
+                    if new_light_status != current_state['light_status']:
+                        current_state['light_status'] = new_light_status
+                        redis_client.hset(REDIS_KEY, 'light_status', new_light_status)
 
-                current = latest_telemetry.copy()
-
-            if current != last_sent and current['received_at'] is not None:
-                yield f"data: {json.dumps(current)}\n\n"
-                last_sent = current.copy()
+            if current_state != last_sent and current_state['received_at'] is not None:
+                yield f"data: {json.dumps(current_state)}\n\n"
+                last_sent = current_state
 
             time.sleep(0.1)
-
+    
     return Response(event_stream(), mimetype='text/event-stream')
 
 
@@ -314,21 +340,27 @@ def on_event(partition_context, event):
 
     try:
         body = event.body_as_json()
-        payload = body # Assuming direct payload
+        payload = body  # Assuming direct payload
 
         # Handle nested payload if necessary
         if "event" in body and "payload" in body["event"]:
             payload = json.loads(body["event"]["payload"])
 
-        with telemetry_lock:
-            latest_telemetry['motion'] = payload.get('motion', False)
-            latest_telemetry['received_at'] = datetime.now().isoformat()
+        # Prepare data to be stored in Redis.
+        # We store booleans and other non-string types as JSON strings.
+        motion_detected = payload.get('motion', False)
+        update_payload = {
+            'motion': json.dumps(motion_detected),
+            'received_at': datetime.now().isoformat()
+        }
+
+        # Update the hash in Redis
+        redis_client.hset(REDIS_KEY, mapping=update_payload)
 
         print(f"Received: motion={payload.get('motion')}")
 
     except Exception as e:
         print(f"Error processing event: {e}")
-
 
 def on_error(partition_context, error):
     print(f"Error on partition {partition_context.partition_id}: {error}")
@@ -340,28 +372,44 @@ def start_event_hub_listener():
         print("WARNING: Event Hub connection string not set or is default. Listener not started.")
         return
 
+    # Initialize state in Redis if it doesn't exist
+    if not redis_client.exists(REDIS_KEY):
+        # Store booleans as JSON strings
+        initial_payload = {
+            'motion': json.dumps(INITIAL_TELEMETRY['motion']),
+            'light_status': INITIAL_TELEMETRY['light_status'],
+            'auto_mode': json.dumps(INITIAL_TELEMETRY['auto_mode']),
+            'received_at': INITIAL_TELEMETRY['received_at'] or ''
+        }
+        redis_client.hset(REDIS_KEY, mapping=initial_payload)
+        print("Initialized state in Redis.")
+
     try:
         client = EventHubConsumerClient.from_connection_string(
             conn_str=EVENT_HUB_CONNECTION_STRING,
             consumer_group=CONSUMER_GROUP,
         )
-
+        
         print("Starting Event Hub listener...")
-        client.receive(
-            on_event=on_event,
-            on_error=on_error,
-            starting_position="-1",
-            max_wait_time=1,
-            prefetch=10,
-        )
+        # Using `receive_batch` in a loop is often more robust for long-running listeners
+        with client:
+            client.receive(
+                on_event=on_event,
+                on_error=on_error,
+                starting_position="-1",  # "-1" is from the beginning of the partition. Use "@latest" for new events.
+            )
     except Exception as e:
         print(f"Failed to start Event Hub listener: {e}")
 
-
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
+    # This lock is no longer strictly needed for state, but can be kept if other global resources are added.
+    telemetry_lock = threading.Lock()
+
     listener_thread = threading.Thread(target=start_event_hub_listener, daemon=True)
     listener_thread.start()
 
+    # Get port from environment variable, defaulting to 5001 for local dev
+    port = int(os.environ.get('PORT', 5001))
     print("Starting Flask server on http://localhost:5001")
-    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
