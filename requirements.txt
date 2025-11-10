@@ -5,3 +5,4 @@ redis
 azure-iot-device
 azure-iot-hub
 six
+gevent>=23.0.0
