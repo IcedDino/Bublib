@@ -9,7 +9,7 @@ from azure.eventhub import EventHubConsumerClient
 import redis
 
 # ---------------- CONFIGURATION ----------------
-EVENT_HUB_CONNECTION_STRING = os.environ.get("EVENT_HUB_CONN_STR") or "Endpoint=sb://iothub-ns-mvptorreta-55640691-46b6b52c16.servicebus.windows.net/;SharedAccessKeyName=service;SharedAccessKey=J9kflef+yGNDptqfJFSLUugtYaOrsNxZ2AIoTP52ALw=;EntityPath=mvptorreta"
+EVENT_HUB_CONNECTION_STRING = os.environ.get("EVENT_HUB_CONN_STR") or "Endpoint=sb://iothub-ns-bulib-65689602-b80f57cbd9.servicebus.windows.net/;SharedAccessKeyName=iothubowner;SharedAccessKey=rnJOnKu+UMSim7VGMB9Yh095RELNyOJphAIoTCbcI2Y=;EntityPath=bulib"
 CONSUMER_GROUP = "$Default"
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
@@ -158,6 +158,13 @@ HTML_TEMPLATE = """
             color: #888;
             font-size: 0.9em;
         }
+        .server-status {
+            position: fixed;
+            bottom: 10px;
+            font-size: 0.8em;
+            color: #888;
+            transition: color 0.5s ease;
+        }
     </style>
 </head>
 <body>
@@ -182,12 +189,15 @@ HTML_TEMPLATE = """
         <div class="timestamp">
             Last Update: <span id="timestamp">Never</span>
         </div>
+
+        <div id="serverStatus" class="server-status">Connecting...</div>
     </div>
 
     <script>
         const powerButton = document.getElementById('powerButton');
         const autoModeSwitch = document.getElementById('autoModeSwitch');
         const motionStatus = document.getElementById('motionStatus');
+        const serverStatus = document.getElementById('serverStatus');
         const timestamp = document.getElementById('timestamp');
 
         // --- Event Listeners for Controls ---
@@ -221,6 +231,11 @@ HTML_TEMPLATE = """
 
         // --- Server-Sent Events for Status Updates ---
         const eventSource = new EventSource('/stream');
+
+        eventSource.onopen = function() {
+            serverStatus.textContent = 'Server Connected';
+            serverStatus.style.color = '#34c759'; // A nice green color
+        };
 
         eventSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
@@ -260,6 +275,8 @@ HTML_TEMPLATE = """
             motionStatus.textContent = 'Connection Lost';
             motionStatus.classList.remove('motion');
             motionStatus.classList.add('no-motion');
+            serverStatus.textContent = 'Connection Lost';
+            serverStatus.style.color = '#ff3b30'; // A red color for errors
         };
     </script>
 </body>
