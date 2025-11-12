@@ -14,9 +14,10 @@ CONSUMER_GROUP = "$Default"
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 IOTHUB_CONNECTION_STRING = os.environ.get("IOT_HUB_CONN_STR")
-DEVICE_ID = "RaspBerry"  # Must match IoT Hub registration exactly
+DEVICE_ID = "RaspBerry"
 
-registry_manager = IoTHubRegistryManager.from_connection_string(IOTHUB_CONNECTION_STRING) if IOTHUB_CONNECTION_STRING else None
+registry_manager = IoTHubRegistryManager.from_connection_string(
+    IOTHUB_CONNECTION_STRING) if IOTHUB_CONNECTION_STRING else None
 
 # ---------------- INITIAL STATE ----------------
 INITIAL_TELEMETRY = {
@@ -32,8 +33,6 @@ REDIS_KEY = "bublib:telemetry"
 
 app = Flask(__name__)
 
-
-# ---------------- HTML (unchanged) ----------------
 # ---------------- HTML TEMPLATE ----------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -78,21 +77,21 @@ HTML_TEMPLATE = """
             color: #888;
         }
         .power-button {
-            width: 100%; /* Set width to match parent container */
-            aspect-ratio: 1 / 1; /* Maintain a 1:1 aspect ratio (a square) */
-            height: auto; /* Allow height to be determined by aspect-ratio */
-            border-radius: 50%; /* Make the square a circle */
-            border: 12px solid #444; /* Adjusted border */
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            height: auto;
+            border-radius: 50%;
+            border: 12px solid #444;
             background-color: #2c2c2e;
             color: white;
-            font-size: 4em; /* Adjusted font size */
+            font-size: 4em;
             font-weight: bold;
             cursor: pointer;
             display: flex;
             justify-content: center;
             align-items: center;
             transition: all 0.3s ease;
-            -webkit-tap-highlight-color: transparent; /* Removes tap highlight on mobile */
+            -webkit-tap-highlight-color: transparent;
         }
         .power-button.on {
             border-color: #007aff;
@@ -105,7 +104,7 @@ HTML_TEMPLATE = """
             cursor: not-allowed;
             opacity: 0.6;
         }
-         .power-button:not(:disabled):active {
+        .power-button:not(:disabled):active {
             transform: scale(0.97);
         }
         .auto-control {
@@ -207,7 +206,6 @@ HTML_TEMPLATE = """
         const serverStatus = document.getElementById('serverStatus');
         const timestamp = document.getElementById('timestamp');
 
-        // --- Event Listeners for Controls ---
         autoModeSwitch.addEventListener('change', function() {
             fetch('/toggle_auto', {
                 method: 'POST',
@@ -217,11 +215,8 @@ HTML_TEMPLATE = """
         });
 
         powerButton.addEventListener('click', function() {
-            // Send the request to the server
             fetch('/manual_control', { method: 'POST' });
 
-            // Optimistic UI update: Immediately toggle the button's state for better feedback
-            // This will be corrected by the server-sent event if the state is out of sync.
             if (!this.disabled) {
                 const isCurrentlyOn = this.classList.contains('on');
                 if (isCurrentlyOn) {
@@ -236,22 +231,21 @@ HTML_TEMPLATE = """
             }
         });
 
-        // --- Server-Sent Events for Status Updates ---
         const eventSource = new EventSource('/stream');
 
         eventSource.onopen = function() {
             serverStatus.textContent = 'Server Connected';
-            serverStatus.style.color = '#34c759'; // A nice green color
+            serverStatus.style.color = '#34c759';
         };
 
         eventSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
 
-            // Update Auto Mode Switch and disable power button if needed
+            console.log('Received SSE:', data); // DEBUG
+
             autoModeSwitch.checked = data.auto_mode;
             powerButton.disabled = data.auto_mode;
 
-            // Update Power Button state (True source of truth)
             if (data.light_status === "ON") {
                 powerButton.textContent = "ON";
                 powerButton.classList.remove('off');
@@ -262,7 +256,6 @@ HTML_TEMPLATE = """
                 powerButton.classList.add('off');
             }
 
-            // Update Motion Status
             if (data.motion) {
                 motionStatus.textContent = "Motion Detected";
                 motionStatus.classList.remove('no-motion');
@@ -273,7 +266,6 @@ HTML_TEMPLATE = """
                 motionStatus.classList.add('no-motion');
             }
 
-            // Update Timestamp
             const date = new Date(Number(data.received_at));
             timestamp.textContent = date.toLocaleString();
         };
@@ -283,12 +275,13 @@ HTML_TEMPLATE = """
             motionStatus.classList.remove('motion');
             motionStatus.classList.add('no-motion');
             serverStatus.textContent = 'Connection Lost';
-            serverStatus.style.color = '#ff3b30'; // A red color for errors
+            serverStatus.style.color = '#ff3b30';
         };
     </script>
 </body>
 </html>
 """
+
 
 # ---------------- ROUTES ----------------
 @app.route('/')
@@ -299,7 +292,9 @@ def index():
 @app.route('/toggle_auto', methods=['POST'])
 def toggle_auto():
     data = request.get_json()
-    redis_client.hset(REDIS_KEY, 'auto_mode', json.dumps(data.get('auto_mode', True)))
+    auto_mode = data.get('auto_mode', True)
+    redis_client.hset(REDIS_KEY, 'auto_mode', json.dumps(auto_mode))
+    print(f"[Toggle Auto] Set auto_mode to {auto_mode}")
     return "OK"
 
 
@@ -323,6 +318,7 @@ def manual_control():
 
                 cmd = "1" if new_light_status == "ON" else "0"
                 registry_manager.send_c2d_message(DEVICE_ID, cmd)
+                print(f"[Manual Control] Sent command '{cmd}' to device")
 
         except redis.exceptions.WatchError:
             pass
@@ -337,39 +333,58 @@ def stream():
         if isinstance(s, bool):
             return s
         if isinstance(s, str):
-            return s.lower() == "true"
+            s_lower = s.lower().strip()
+            if s_lower == "true":
+                return True
+            elif s_lower == "false":
+                return False
+            elif s_lower in ("1", "0"):
+                return s_lower == "1"
         return False
 
     def event_stream():
         last_sent = None
+        iteration = 0
         while True:
+            iteration += 1
             data = redis_client.hgetall(REDIS_KEY)
+
+            motion_raw = data.get('motion', 'false')
+            motion_parsed = parse_bool(motion_raw)
+
             state = {
-                'motion': parse_bool(data.get('motion', 'false')),
+                'motion': motion_parsed,
                 'light_status': data.get('light_status', INITIAL_TELEMETRY['light_status']),
                 'auto_mode': parse_bool(data.get('auto_mode', 'true')),
                 'received_at': data.get('received_at', None)
             }
 
+            # Debug logging every 10 iterations
+            if iteration % 10 == 0:
+                print(f"[Stream] motion_raw={motion_raw}, motion_parsed={motion_parsed}, light={state['light_status']}")
+
             if state['auto_mode']:
                 desired = 'ON' if state['motion'] else 'OFF'
                 if desired != state['light_status']:
-                    # Update state in Redis
                     redis_client.hset(REDIS_KEY, 'light_status', desired)
                     state['light_status'] = desired
 
-                    # Send command to device if configured
+                    print(f"[Auto-mode] Motion={state['motion']} → Light={desired}")
+
                     if registry_manager:
                         cmd = "1" if desired == "ON" else "0"
-                        registry_manager.send_c2d_message(DEVICE_ID, cmd)
-                        print(f"Auto-mode: sent command '{cmd}' to device '{DEVICE_ID}'")
+                        try:
+                            registry_manager.send_c2d_message(DEVICE_ID, cmd)
+                            print(f"[IoT Hub] Sent '{cmd}' to '{DEVICE_ID}'")
+                        except Exception as e:
+                            print(f"[IoT Hub] Error: {e}")
 
-            # Only send SSE if state changed and we have a timestamp
             if state != last_sent and state['received_at'] is not None:
+                print(f"[SSE] Sending: motion={state['motion']}, light={state['light_status']}")
                 yield f"data: {json.dumps(state)}\n\n"
-                last_sent = state
+                last_sent = dict(state)
 
-            time.sleep(0.1)  # adjust as needed
+            time.sleep(0.1)
 
     return Response(
         event_stream(),
@@ -381,13 +396,18 @@ def stream():
     )
 
 
+@app.route('/debug')
+def debug():
+    """Debug endpoint to check Redis state"""
+    data = redis_client.hgetall(REDIS_KEY)
+    return f"<pre>{json.dumps(data, indent=2)}</pre>"
+
 
 # ---------------- EVENT HUB LISTENER ----------------
 def on_event(partition_context, event):
     try:
         body = event.body_as_json(encoding='utf-8')
 
-        # Normalize payload shape
         if "event" in body and "payload" in body["event"]:
             payload = body["event"]["payload"]
         elif "payload" in body:
@@ -395,33 +415,49 @@ def on_event(partition_context, event):
         else:
             payload = body
 
-        # Motion may be bool, int, or string → force correct bool
         raw_motion = payload.get("motion", False)
-        motion_detected = bool(int(raw_motion)) if isinstance(raw_motion, (str, int)) else bool(raw_motion)
 
-        # Timestamp from Event Hub (UTC → epoch ms)
+        # Convert to boolean properly
+        if isinstance(raw_motion, bool):
+            motion_detected = raw_motion
+        elif isinstance(raw_motion, str):
+            motion_detected = raw_motion.lower() == "true" or raw_motion == "1"
+        elif isinstance(raw_motion, int):
+            motion_detected = bool(raw_motion)
+        else:
+            motion_detected = bool(raw_motion)
+
         enq_time = event.enqueued_time
         received_at_ms = int(enq_time.timestamp() * 1000)
+
+        print(f"[EventHub] Received: motion={motion_detected} (raw={raw_motion})")
 
         redis_client.hset(REDIS_KEY, mapping={
             'motion': json.dumps(motion_detected),
             'received_at': received_at_ms
         })
 
+        # Verify what was written
+        verify = redis_client.hget(REDIS_KEY, 'motion')
+        print(f"[EventHub] Wrote to Redis: motion={verify}")
+
     except Exception as e:
-        print("Error processing event:", e)
+        print(f"[EventHub] Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def on_error(partition_context, error):
-    print(f"EventHub Error: {error}")
+    print(f"[EventHub] Error: {error}")
 
 
 def start_event_hub_listener():
     if not EVENT_HUB_CONNECTION_STRING:
-        print("No EVENT_HUB_CONN_STR. Listener will not start.")
+        print("[EventHub] No connection string. Listener not started.")
         return
 
     if not redis_client.exists(REDIS_KEY):
+        print("[EventHub] Initializing Redis with default state")
         redis_client.hset(REDIS_KEY, mapping={
             'motion': json.dumps(INITIAL_TELEMETRY['motion']),
             'light_status': INITIAL_TELEMETRY['light_status'],
@@ -434,26 +470,22 @@ def start_event_hub_listener():
         consumer_group=CONSUMER_GROUP
     )
 
-    print("Starting EventHub listener... (latest only)")
+    print("[EventHub] Starting listener (latest messages only)...")
     with client:
         client.receive(
             on_event=on_event,
             on_error=on_error,
-            starting_position='@latest',  # <-- prevents replay
+            starting_position='@latest',
             max_wait_time=30
         )
 
 
-# ---------------- CONTROL LISTENER START ----------------
-# Start listener ONLY when RUN_EVENT_LISTENER=1 to avoid duplicate consumers.
+# ---------------- START LISTENER ----------------
 if os.environ.get("RUN_EVENT_LISTENER") == "1":
     listener_thread = threading.Thread(target=start_event_hub_listener, daemon=True)
     listener_thread.start()
-
 
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
