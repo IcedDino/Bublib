@@ -365,13 +365,21 @@ def stream():
 def on_event(partition_context, event):
     try:
         body = event.body_as_json(encoding='utf-8')
-        payload = body.get("event", {}).get("payload", body)
-        if isinstance(payload, str):
-            payload = json.loads(payload)
 
-        motion_detected = payload.get('motion', False)
+        # Normalize payload shape
+        if "event" in body and "payload" in body["event"]:
+            payload = body["event"]["payload"]
+        elif "payload" in body:
+            payload = body["payload"]
+        else:
+            payload = body
 
-        enq_time = event.enqueued_time  # UTC datetime
+        # Motion may be bool, int, or string → force correct bool
+        raw_motion = payload.get("motion", False)
+        motion_detected = bool(int(raw_motion)) if isinstance(raw_motion, (str, int)) else bool(raw_motion)
+
+        # Timestamp from Event Hub (UTC → epoch ms)
+        enq_time = event.enqueued_time
         received_at_ms = int(enq_time.timestamp() * 1000)
 
         redis_client.hset(REDIS_KEY, mapping={
@@ -380,7 +388,7 @@ def on_event(partition_context, event):
         })
 
     except Exception as e:
-        print("Event processing error:", e)
+        print("Error processing event:", e)
 
 
 def on_error(partition_context, error):
