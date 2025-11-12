@@ -14,7 +14,7 @@ EVENT_HUB_CONNECTION_STRING = os.environ.get("EVENT_HUB_CONN_STR")
 CONSUMER_GROUP = "$Default"
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 IOTHUB_CONNECTION_STRING = os.environ.get("IOT_HUB_CONN_STR")
-DEVICE_ID = "RaspBerry"  # Must match IoT Hub device
+DEVICE_ID = "RaspBerry"
 
 registry_manager = (
     IoTHubRegistryManager.from_connection_string(IOTHUB_CONNECTION_STRING)
@@ -80,21 +80,21 @@ HTML_TEMPLATE = """
             color: #888;
         }
         .power-button {
-            width: 100%; /* Set width to match parent container */
-            aspect-ratio: 1 / 1; /* Maintain a 1:1 aspect ratio (a square) */
-            height: auto; /* Allow height to be determined by aspect-ratio */
-            border-radius: 50%; /* Make the square a circle */
-            border: 12px solid #444; /* Adjusted border */
+            width: 100%;
+            aspect-ratio: 1 / 1;
+            height: auto;
+            border-radius: 50%;
+            border: 12px solid #444;
             background-color: #2c2c2e;
             color: white;
-            font-size: 4em; /* Adjusted font size */
+            font-size: 4em;
             font-weight: bold;
             cursor: pointer;
             display: flex;
             justify-content: center;
             align-items: center;
             transition: all 0.3s ease;
-            -webkit-tap-highlight-color: transparent; /* Removes tap highlight on mobile */
+            -webkit-tap-highlight-color: transparent;
         }
         .power-button.on {
             border-color: #007aff;
@@ -174,6 +174,20 @@ HTML_TEMPLATE = """
             color: #888;
             transition: color 0.5s ease;
         }
+        .debug-log {
+            position: fixed;
+            bottom: 40px;
+            left: 10px;
+            right: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 10px;
+            border-radius: 10px;
+            font-size: 0.7em;
+            max-height: 150px;
+            overflow-y: auto;
+            display: none;
+        }
+        .debug-log.show { display: block; }
     </style>
 </head>
 <body>
@@ -200,6 +214,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="serverStatus" class="server-status">Connecting...</div>
+        <div id="debugLog" class="debug-log"></div>
     </div>
 
     <script>
@@ -208,9 +223,25 @@ HTML_TEMPLATE = """
         const motionStatus = document.getElementById('motionStatus');
         const serverStatus = document.getElementById('serverStatus');
         const timestamp = document.getElementById('timestamp');
+        const debugLog = document.getElementById('debugLog');
 
-        // --- Event Listeners for Controls ---
+        // Show debug log on triple-tap
+        let tapCount = 0;
+        document.body.addEventListener('click', function() {
+            tapCount++;
+            setTimeout(() => tapCount = 0, 500);
+            if (tapCount === 3) {
+                debugLog.classList.toggle('show');
+            }
+        });
+
+        function addDebug(msg) {
+            const time = new Date().toLocaleTimeString();
+            debugLog.innerHTML = `[${time}] ${msg}<br>` + debugLog.innerHTML;
+        }
+
         autoModeSwitch.addEventListener('change', function() {
+            addDebug(`Auto mode: ${this.checked}`);
             fetch('/toggle_auto', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -219,11 +250,9 @@ HTML_TEMPLATE = """
         });
 
         powerButton.addEventListener('click', function() {
-            // Send the request to the server
+            addDebug('Manual control clicked');
             fetch('/manual_control', { method: 'POST' });
 
-            // Optimistic UI update: Immediately toggle the button's state for better feedback
-            // This will be corrected by the server-sent event if the state is out of sync.
             if (!this.disabled) {
                 const isCurrentlyOn = this.classList.contains('on');
                 if (isCurrentlyOn) {
@@ -238,22 +267,21 @@ HTML_TEMPLATE = """
             }
         });
 
-        // --- Server-Sent Events for Status Updates ---
         const eventSource = new EventSource('/stream');
 
         eventSource.onopen = function() {
             serverStatus.textContent = 'Server Connected';
-            serverStatus.style.color = '#34c759'; // A nice green color
+            serverStatus.style.color = '#34c759';
+            addDebug('Connected to server');
         };
 
         eventSource.onmessage = function(event) {
             const data = JSON.parse(event.data);
+            addDebug(`Update: motion=${data.motion}, light=${data.light_status}, auto=${data.auto_mode}`);
 
-            // Update Auto Mode Switch and disable power button if needed
             autoModeSwitch.checked = data.auto_mode;
             powerButton.disabled = data.auto_mode;
 
-            // Update Power Button state (True source of truth)
             if (data.light_status === "ON") {
                 powerButton.textContent = "ON";
                 powerButton.classList.remove('off');
@@ -264,7 +292,6 @@ HTML_TEMPLATE = """
                 powerButton.classList.add('off');
             }
 
-            // Update Motion Status
             if (data.motion) {
                 motionStatus.textContent = "Motion Detected";
                 motionStatus.classList.remove('no-motion');
@@ -275,7 +302,6 @@ HTML_TEMPLATE = """
                 motionStatus.classList.add('no-motion');
             }
 
-            // Update Timestamp
             const date = new Date(data.received_at);
             timestamp.textContent = date.toLocaleString();
         };
@@ -285,27 +311,89 @@ HTML_TEMPLATE = """
             motionStatus.classList.remove('motion');
             motionStatus.classList.add('no-motion');
             serverStatus.textContent = 'Connection Lost';
-            serverStatus.style.color = '#ff3b30'; // A red color for errors
+            serverStatus.style.color = '#ff3b30';
+            addDebug('Connection lost');
         };
     </script>
 </body>
 </html>
 """
 
+
+# ---------------- AUTO MODE CONTROLLER (BACKGROUND THREAD) ----------------
+def auto_mode_controller():
+    """
+    Separate thread that continuously monitors motion state
+    and sends LED commands when in auto mode.
+    """
+    print("Auto-mode controller started.")
+    last_light_status = None
+
+    while True:
+        try:
+            with telemetry_lock:
+                data = redis_client.hgetall(REDIS_KEY)
+                if not data:
+                    time.sleep(0.5)
+                    continue
+
+                auto_mode = json.loads(data.get('auto_mode', 'true'))
+                motion = json.loads(data.get('motion', 'false'))
+                current_light_status = data.get('light_status', 'OFF')
+
+                # Only take action in auto mode
+                if auto_mode:
+                    desired_status = 'ON' if motion else 'OFF'
+
+                    # Only send command if status needs to change
+                    if desired_status != current_light_status:
+                        print(f"[AUTO] Motion={motion}, changing light {current_light_status} -> {desired_status}")
+
+                        # Update Redis first
+                        redis_client.hset(REDIS_KEY, 'light_status', desired_status)
+
+                        # Send command to device
+                        if registry_manager:
+                            cmd = "1" if desired_status == "ON" else "0"
+                            try:
+                                registry_manager.send_c2d_message(DEVICE_ID, cmd)
+                                print(f"[AUTO] Sent command '{cmd}' to device '{DEVICE_ID}'")
+                            except Exception as e:
+                                print(f"[AUTO] Error sending command: {e}")
+                        else:
+                            print("[AUTO] Registry manager not configured")
+
+                        last_light_status = desired_status
+                    elif last_light_status != current_light_status:
+                        # Track status for logging
+                        last_light_status = current_light_status
+                        print(f"[AUTO] Light status: {current_light_status}, Motion: {motion}")
+
+        except Exception as e:
+            print(f"[AUTO] Error in controller: {e}")
+
+        time.sleep(0.2)  # Check 5 times per second
+
+
 # ---------------- FLASK ROUTES ----------------
 @app.route('/')
 def index():
     return HTML_TEMPLATE
 
+
 @app.route('/toggle_auto', methods=['POST'])
 def toggle_auto():
     data = request.get_json()
-    redis_client.hset(REDIS_KEY, 'auto_mode', json.dumps(data.get('auto_mode', True)))
+    auto_mode = data.get('auto_mode', True)
+    redis_client.hset(REDIS_KEY, 'auto_mode', json.dumps(auto_mode))
+    print(f"Auto mode set to: {auto_mode}")
     return "OK"
+
 
 @app.route('/manual_control', methods=['POST'])
 def manual_control():
     if not registry_manager:
+        print("Manual control failed: IoT Hub not configured")
         return "IoT Hub not configured", 500
 
     with redis_client.pipeline() as pipe:
@@ -323,11 +411,16 @@ def manual_control():
 
                 cmd = "1" if new_status == "ON" else "0"
                 registry_manager.send_c2d_message(DEVICE_ID, cmd)
+                print(f"[MANUAL] Sent command '{cmd}' to device, new status: {new_status}")
+            else:
+                print("[MANUAL] Command ignored - auto mode is enabled")
 
         except redis.exceptions.WatchError:
+            print("[MANUAL] Redis watch error - concurrent modification")
             pass
 
     return "OK"
+
 
 @app.route('/stream')
 def stream():
@@ -343,16 +436,6 @@ def stream():
                     'received_at': data.get('received_at', None)
                 }
 
-                if state['auto_mode']:
-                    desired = 'ON' if state['motion'] else 'OFF'
-                    if desired != state['light_status']:
-                        redis_client.hset(REDIS_KEY, 'light_status', desired)
-                        state['light_status'] = desired
-                        if registry_manager:
-                            cmd = "1" if desired == "ON" else "0"
-                            registry_manager.send_c2d_message(DEVICE_ID, cmd)
-                            print(f"Auto-mode: sent '{cmd}' to '{DEVICE_ID}'")
-
             if state != last_sent and state['received_at']:
                 yield f"data: {json.dumps(state)}\n\n"
                 last_sent = state
@@ -364,6 +447,7 @@ def stream():
         mimetype='text/event-stream',
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
     )
+
 
 # ---------------- AZURE EVENT HUB LISTENER ----------------
 def on_event(partition_context, event):
@@ -378,16 +462,19 @@ def on_event(partition_context, event):
             'motion': json.dumps(motion_detected),
             'received_at': datetime.now().isoformat()
         })
+        print(f"[EVENT HUB] Received motion: {motion_detected}")
     except Exception as e:
-        print(f"Error processing event: {e}")
+        print(f"[EVENT HUB] Error processing event: {e}")
+
 
 def on_error(partition_context, error):
     if error:
-        print(f"EventHub listener error on partition {partition_context.partition_id}: {error}")
+        print(f"[EVENT HUB] Error on partition {partition_context.partition_id}: {error}")
+
 
 def start_event_hub_listener():
     if not EVENT_HUB_CONNECTION_STRING:
-        print("EVENT_HUB_CONN_STR not set. Event Hub listener not started.")
+        print("[EVENT HUB] Connection string not set. Listener not started.")
         return
 
     if not redis_client.exists(REDIS_KEY):
@@ -397,13 +484,14 @@ def start_event_hub_listener():
             'auto_mode': json.dumps(INITIAL_TELEMETRY['auto_mode']),
             'received_at': ''
         })
+        print("[EVENT HUB] Initialized Redis with default values")
 
     client = EventHubConsumerClient.from_connection_string(
         conn_str=EVENT_HUB_CONNECTION_STRING,
         consumer_group=CONSUMER_GROUP
     )
 
-    print("Starting Event Hub listener...")
+    print("[EVENT HUB] Starting listener...")
     try:
         with client:
             client.receive(
@@ -412,13 +500,21 @@ def start_event_hub_listener():
                 starting_position="-1"
             )
     except Exception as e:
-        print(f"Event Hub listener failed: {e}")
+        print(f"[EVENT HUB] Listener failed: {e}")
 
-# ---------------- START LISTENER ----------------
+
+# ---------------- START BACKGROUND THREADS ----------------
 listener_thread = threading.Thread(target=start_event_hub_listener, daemon=True)
 listener_thread.start()
+
+# Start the auto-mode controller in a separate thread
+auto_controller_thread = threading.Thread(target=auto_mode_controller, daemon=True)
+auto_controller_thread.start()
 
 # ---------------- MAIN ----------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    print(f"Starting Flask app on port {port}...")
+    print(f"Registry manager configured: {registry_manager is not None}")
+    print(f"Event Hub configured: {EVENT_HUB_CONNECTION_STRING is not None}")
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
