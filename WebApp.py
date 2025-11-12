@@ -332,33 +332,54 @@ def manual_control():
 
 @app.route('/stream')
 def stream():
+    def parse_bool(s):
+        """Safely parse a Redis string to Python boolean."""
+        if isinstance(s, bool):
+            return s
+        if isinstance(s, str):
+            return s.lower() == "true"
+        return False
+
     def event_stream():
         last_sent = None
         while True:
             data = redis_client.hgetall(REDIS_KEY)
             state = {
-                'motion': json.loads(data.get('motion', 'false')),
+                'motion': parse_bool(data.get('motion', 'false')),
                 'light_status': data.get('light_status', INITIAL_TELEMETRY['light_status']),
-                'auto_mode': json.loads(data.get('auto_mode', 'true')),
+                'auto_mode': parse_bool(data.get('auto_mode', 'true')),
                 'received_at': data.get('received_at', None)
             }
 
             if state['auto_mode']:
                 desired = 'ON' if state['motion'] else 'OFF'
                 if desired != state['light_status']:
+                    # Update state in Redis
                     redis_client.hset(REDIS_KEY, 'light_status', desired)
                     state['light_status'] = desired
+
+                    # Send command to device if configured
                     if registry_manager:
                         cmd = "1" if desired == "ON" else "0"
                         registry_manager.send_c2d_message(DEVICE_ID, cmd)
+                        print(f"Auto-mode: sent command '{cmd}' to device '{DEVICE_ID}'")
 
+            # Only send SSE if state changed and we have a timestamp
             if state != last_sent and state['received_at'] is not None:
                 yield f"data: {json.dumps(state)}\n\n"
                 last_sent = state
 
-            time.sleep(0.3)  # reduced update pressure
+            time.sleep(0.1)  # adjust as needed
 
-    return Response(event_stream(), mimetype='text/event-stream', headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
 
 
 # ---------------- EVENT HUB LISTENER ----------------
