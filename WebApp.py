@@ -175,19 +175,22 @@ HTML_TEMPLATE = """
             transition: color 0.5s ease;
         }
         .debug-log {
-            position: fixed;
-            bottom: 40px;
-            left: 10px;
-            right: 10px;
-            background: rgba(0,0,0,0.8);
-            padding: 10px;
-            border-radius: 10px;
-            font-size: 0.7em;
-            max-height: 150px;
+            background: #2c2c2e;
+            border-radius: 15px;
+            padding: 15px;
+            font-size: 0.75em;
+            max-height: 200px;
             overflow-y: auto;
-            display: none;
+            width: 100%;
+            box-sizing: border-box;
+            font-family: 'Courier New', monospace;
+            text-align: left;
+            color: #00ff00;
         }
-        .debug-log.show { display: block; }
+        .debug-log .debug-line {
+            margin: 3px 0;
+            line-height: 1.4;
+        }
     </style>
 </head>
 <body>
