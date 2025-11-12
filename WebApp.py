@@ -14,8 +14,8 @@ CONSUMER_GROUP = "$Default"
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 
 IOTHUB_CONNECTION_STRING = os.environ.get("IOT_HUB_CONN_STR")
-DEVICE_ID = "RaspBerry"  # EXACT SAME name registered in IoT Hub
-# Initialize registry_manager only if the connection string is available
+DEVICE_ID = "RaspBerry"  # Must match IoT Hub registration exactly
+
 registry_manager = IoTHubRegistryManager.from_connection_string(IOTHUB_CONNECTION_STRING) if IOTHUB_CONNECTION_STRING else None
 
 # ---------------- INITIAL STATE ----------------
@@ -32,6 +32,8 @@ REDIS_KEY = "bublib:telemetry"
 
 app = Flask(__name__)
 
+
+# ---------------- HTML (unchanged) ----------------
 # ---------------- HTML TEMPLATE ----------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -272,7 +274,7 @@ HTML_TEMPLATE = """
             }
 
             // Update Timestamp
-            const date = new Date(data.received_at);
+            const date = new Date(Number(data.received_at));
             timestamp.textContent = date.toLocaleString();
         };
 
@@ -288,6 +290,7 @@ HTML_TEMPLATE = """
 </html>
 """
 
+# ---------------- ROUTES ----------------
 @app.route('/')
 def index():
     return HTML_TEMPLATE
@@ -318,16 +321,13 @@ def manual_control():
                 pipe.hset(REDIS_KEY, 'light_status', new_light_status)
                 pipe.execute()
 
-                # ---- SEND COMMAND TO DEVICE HERE ----
                 cmd = "1" if new_light_status == "ON" else "0"
                 registry_manager.send_c2d_message(DEVICE_ID, cmd)
 
         except redis.exceptions.WatchError:
-            # The key was modified by another client, abort the transaction
             pass
 
     return "OK"
-
 
 
 @app.route('/stream')
@@ -335,45 +335,33 @@ def stream():
     def event_stream():
         last_sent = None
         while True:
-            with telemetry_lock:
-                data = redis_client.hgetall(REDIS_KEY)
-                state = {
-                    'motion': json.loads(data.get('motion', 'false')),
-                    'light_status': data.get('light_status', INITIAL_TELEMETRY['light_status']),
-                    'auto_mode': json.loads(data.get('auto_mode', 'true')),
-                    'received_at': data.get('received_at', None)
-                }
+            data = redis_client.hgetall(REDIS_KEY)
+            state = {
+                'motion': json.loads(data.get('motion', 'false')),
+                'light_status': data.get('light_status', INITIAL_TELEMETRY['light_status']),
+                'auto_mode': json.loads(data.get('auto_mode', 'true')),
+                'received_at': data.get('received_at', None)
+            }
 
-                if state['auto_mode']:
-                    desired = 'ON' if state['motion'] else 'OFF'
-                    if desired != state['light_status']:
-                        # Update state in Redis
-                        redis_client.hset(REDIS_KEY, 'light_status', desired)
-                        state['light_status'] = desired  # Update for immediate SSE send
-
-                        # Send command to device if configured
-                        if registry_manager:
-                            cmd = "1" if desired == "ON" else "0"
-                            registry_manager.send_c2d_message(DEVICE_ID, cmd)
-                            print(f"Auto-mode: sent command '{cmd}' to device '{DEVICE_ID}'")
+            if state['auto_mode']:
+                desired = 'ON' if state['motion'] else 'OFF'
+                if desired != state['light_status']:
+                    redis_client.hset(REDIS_KEY, 'light_status', desired)
+                    state['light_status'] = desired
+                    if registry_manager:
+                        cmd = "1" if desired == "ON" else "0"
+                        registry_manager.send_c2d_message(DEVICE_ID, cmd)
 
             if state != last_sent and state['received_at'] is not None:
                 yield f"data: {json.dumps(state)}\n\n"
                 last_sent = state
 
-            time.sleep(0.1)
+            time.sleep(0.3)  # reduced update pressure
 
-    return Response(
-        event_stream(),
-        mimetype='text/event-stream',
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no"
-        }
-    )
+    return Response(event_stream(), mimetype='text/event-stream', headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-# ---------------- AZURE EVENT HUB LISTENER ----------------
+# ---------------- EVENT HUB LISTENER ----------------
 def on_event(partition_context, event):
     try:
         body = event.body_as_json(encoding='utf-8')
@@ -382,22 +370,26 @@ def on_event(partition_context, event):
             payload = json.loads(payload)
 
         motion_detected = payload.get('motion', False)
+
+        enq_time = event.enqueued_time  # UTC datetime
+        received_at_ms = int(enq_time.timestamp() * 1000)
+
         redis_client.hset(REDIS_KEY, mapping={
             'motion': json.dumps(motion_detected),
-            'received_at': datetime.now().isoformat()
+            'received_at': received_at_ms
         })
+
     except Exception as e:
-        print(f"Error processing event: {e}")
+        print("Event processing error:", e)
 
 
 def on_error(partition_context, error):
-    if error:
-        print(f"EventHub listener error on partition {partition_context.partition_id}: {error}")
+    print(f"EventHub Error: {error}")
 
 
 def start_event_hub_listener():
     if not EVENT_HUB_CONNECTION_STRING:
-        print("EVENT_HUB_CONN_STR not set. Event Hub listener will not start.")
+        print("No EVENT_HUB_CONN_STR. Listener will not start.")
         return
 
     if not redis_client.exists(REDIS_KEY):
@@ -409,29 +401,30 @@ def start_event_hub_listener():
         })
 
     client = EventHubConsumerClient.from_connection_string(
-        conn_str=EVENT_HUB_CONNECTION_STRING,
-        consumer_group=CONSUMER_GROUP,
+        EVENT_HUB_CONNECTION_STRING,
+        consumer_group=CONSUMER_GROUP
     )
-    print("Starting Event Hub listener...")
-    try:
-        with client:
-            client.receive(
-                on_event=on_event,
-                on_error=on_error,
-                starting_position="-1",  # Start from the latest event
-            )
-    except Exception as e:
-        print(f"Event Hub listener failed to start: {e}")
+
+    print("Starting EventHub listener... (latest only)")
+    with client:
+        client.receive(
+            on_event=on_event,
+            on_error=on_error,
+            starting_position='@latest',  # <-- prevents replay
+            max_wait_time=30
+        )
 
 
-# ---------------- GLOBAL START (works in Gunicorn) ----------------
-telemetry_lock = threading.Lock()
+# ---------------- CONTROL LISTENER START ----------------
+# Start listener ONLY when RUN_EVENT_LISTENER=1 to avoid duplicate consumers.
+if os.environ.get("RUN_EVENT_LISTENER") == "1":
+    listener_thread = threading.Thread(target=start_event_hub_listener, daemon=True)
+    listener_thread.start()
 
-listener_thread = threading.Thread(target=start_event_hub_listener, daemon=True)
-listener_thread.start()
 
-
-# ---------------- MAIN (local dev) ----------------
+# ---------------- MAIN ----------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
+
+
